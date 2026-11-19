@@ -128,16 +128,14 @@ export default function SubscriptionModal({
               >
                 Refresh status
               </button>
-              {!status?.owner && (
-                <button
-                  ref={primaryButtonRef}
-                  className="subscription-modal-btn subscription-modal-btn-primary"
-                  onClick={onPrimaryAction}
-                  disabled={loading}
-                >
-                  {loading ? "Processing..." : action.label}
-                </button>
-              )}
+              <button
+                ref={primaryButtonRef}
+                className="subscription-modal-btn subscription-modal-btn-primary"
+                onClick={onPrimaryAction}
+                disabled={loading}
+              >
+                {loading ? "Processing..." : action.label}
+              </button>
             </div>
           </motion.div>
         </motion.div>

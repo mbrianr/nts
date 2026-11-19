@@ -88,6 +88,4 @@ export interface SubscriptionStatus {
   trialEndsAt: string | null;
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
-  /** Cuenta del dueño: premium permanente, sin facturación. */
-  owner?: boolean;
 }
