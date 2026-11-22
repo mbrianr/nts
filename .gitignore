@@ -17,10 +17,17 @@ coverage/
 *.tsbuildinfo
 
 tests/
+!tests/
+tests/*
+!tests/offline/
+tests/offline/*
+!tests/offline/*.spec.js
+!tests/offline/*.test.js
 test-results/
 playwright.config.ts
 playwright-report/
 test-data-*
+.mock-profile/
 
 # Generated git notes & exports
 exported_git_notes/

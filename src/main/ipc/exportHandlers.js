@@ -5,6 +5,7 @@ const fsSync = require("fs");
 const archiver = require("archiver");
 const AdmZip = require("adm-zip");
 const { apiRequest } = require("../apiProxy.js");
+const { hasPremiumAccess } = require("../../shared/subscriptionStatus.js");
 
 function sendProgress(event, data) {
   try {
@@ -12,8 +13,48 @@ function sendProgress(event, data) {
   } catch { }
 }
 
+/**
+ * Verifica la suscripción contra la API antes de cada operación premium.
+ * Devuelve null si hay acceso, o el resultado de error listo para el renderer.
+ * El gate de la UI es cosmético: esto es lo que no se puede saltear por IPC.
+ */
+async function checkPremiumAccess() {
+  let status;
+  try {
+    status = await apiRequest("/subscription/status");
+  } catch {
+    return {
+      success: false,
+      code: "SUBSCRIPTION_UNVERIFIED",
+      error: "Could not verify your subscription. Please try again when you are back online.",
+    };
+  }
+
+  if (!hasPremiumAccess(status?.status)) {
+    return {
+      success: false,
+      code: "PREMIUM_REQUIRED",
+      error: "Premium subscription required for export and import",
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Registra un canal IPC que exige suscripción. El chequeo corre en el main
+ * process antes de tocar la API, el filesystem o los dialogos nativos.
+ */
+function handlePremium(channel, handler) {
+  ipcMain.handle(channel, async (event, ...args) => {
+    const premiumError = await checkPremiumAccess();
+    if (premiumError) return premiumError;
+    return handler(event, ...args);
+  });
+}
+
 function registerExportHandlers() {
-  ipcMain.handle("export-note-json", async (event, noteId) => {
+  handlePremium("export-note-json", async (event, noteId) => {
     try {
       sendProgress(event, { status: "loading", percent: 0, message: "Preparing export..." });
       const allData = await apiRequest("/notes/all");
@@ -54,7 +95,7 @@ function registerExportHandlers() {
     }
   });
 
-  ipcMain.handle("export-note-md", async (event, noteId) => {
+  handlePremium("export-note-md", async (event, noteId) => {
     try {
       sendProgress(event, { status: "loading", percent: 0, message: "Preparing export..." });
       const allData = await apiRequest("/notes/all");
@@ -145,7 +186,7 @@ function registerExportHandlers() {
     }
   });
 
-  ipcMain.handle("import-note", async (event) => {
+  handlePremium("import-note", async (event) => {
     try {
       const result = await dialog.showOpenDialog({
         title: "Import Note(s)",
@@ -296,7 +337,7 @@ function registerExportHandlers() {
     }
   });
 
-  ipcMain.handle("export-all-notes", async (event) => {
+  handlePremium("export-all-notes", async (event) => {
     try {
       const result = await dialog.showSaveDialog({
         title: "Export All Notes",
@@ -404,4 +445,4 @@ function parseFrontmatter(str) {
   }
   return result;
 }
-module.exports = { registerExportHandlers };
+module.exports = { registerExportHandlers, checkPremiumAccess };
