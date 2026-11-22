@@ -465,7 +465,13 @@ const EditorPanel = memo(function EditorPanel({
     // Si el documento ya contiene lo último que escribió el usuario, no se
     // reemplaza: el envío a onChange está diferido y la prop llega con retraso.
     // Sustituir todo el documento en ese momento provoca tirones y saltos de cursor.
-    if (currentContent === lastLocalContentRef.current) return;
+    // Pero si la prop trae algo distinto a lo último escrito (carga inicial
+    // desde el servidor), sí hay que aplicarlo aunque el editor siga vacío.
+    if (
+      currentContent === lastLocalContentRef.current &&
+      lastLocalContentRef.current === (note.content || "")
+    )
+      return;
 
     const scrollInfo = viewRef.current.scrollDOM.scrollTop;
     const nextContent = note.content || "";
