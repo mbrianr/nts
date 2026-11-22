@@ -23,10 +23,66 @@ import FolderSearchModal from "../components/FolderSearchModal";
 import ConfirmModal from "../components/ConfirmModal";
 import SubscriptionModal from "../components/SubscriptionModal";
 import ProgressToast from "../components/ProgressToast";
+const BrainGraph = React.lazy(() => import("../components/BrainGraph"));
 import type { ProgressData } from "../types/models";
 import { apiClient } from "../services/apiClient";
-import { getSubscriptionSummary, getSubscriptionAction, } from "../utils/subscription";
+import { getSubscriptionSummary, getSubscriptionAction, getPremiumRejectionMessage } from "../utils/subscription";
 import { getCachedContent, setCachedContent } from "../utils/contentCache";
+
+// Devuelve la misma referencia mientras el valor sea equivalente: evita que
+// Sidebar vuelva a medir el layout en cada guardado mientras se escribe.
+function useStableValue<T>(value: T, isEqual: (a: T, b: T) => boolean): T {
+  const ref = useRef(value);
+  if (!isEqual(ref.current, value)) ref.current = value;
+  return ref.current;
+}
+
+// Cada emisión del store llega como objetos nuevos (el preload los copia), así
+// que la lista, el sidebar y la nota activa se repintaban aunque nada hubiera
+// cambiado. Se reutiliza el objeto anterior cuando los datos son equivalentes.
+function recordsEqual(a: object, b: object): boolean {
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  keys.delete("content");
+  keys.delete("drawingData");
+  for (const key of keys) {
+    if (!Object.is(left[key], right[key])) return false;
+  }
+  // El contenido cargado en memoria sí importa (puede venir de otra ventana o
+  // de la API). Cuando está desalojado (`undefined`) se ignora, para que una
+  // emisión no vuelva a hidratar las notas que el editor acaba de vaciar.
+  for (const field of ["content", "drawingData"]) {
+    const previous = left[field];
+    if (previous !== undefined && previous !== right[field]) return false;
+  }
+  return true;
+}
+
+function reconcileById<T extends { id: number }>(
+  prev: T[],
+  incoming: T[],
+  isEqual: (a: T, b: T) => boolean = recordsEqual,
+): T[] {
+  if (prev === incoming) return prev;
+  const previousById = new Map(prev.map((item) => [item.id, item]));
+  let changed = prev.length !== incoming.length;
+  const next = incoming.map((item) => {
+    const previous = previousById.get(item.id);
+    if (previous && isEqual(previous, item)) return previous;
+    changed = true;
+    return item;
+  });
+  if (!changed) {
+    for (let i = 0; i < next.length; i++) {
+      if (next[i] !== prev[i]) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  return changed ? next : prev;
+}
 
 interface DashboardProps {
   userName: string;
@@ -40,65 +96,13 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
   const [folders, setFolders] = useState<Folder[]>([]);
   const [view, setView] = useState("all-notes");
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
+  const [graphTag, setGraphTag] = useState<string | null>(null);
   const [currentId, setCurrentId] = useState<number | null>(null);
   const [linkedNoteId, setLinkedNoteId] = useState<number | null>(null);
   const [folderToUpdate, setFolderToUpdate] = useState<Folder | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastType, setToastType] = useState<"success" | "error">("error");
 
-  // TODO: remove — dev.. test all toast messages
-  // Usage: __testToast()          → cycles through all toasts automatically
-  //        __testToast("success") → show only success toasts
-  //        __testToast("error")   → show only error toasts
-  //        __testToast("progress")→ show ProgressToast states
-  useEffect(() => {
-    const allToasts: { msg: string; type: "success" | "error" }[] = [
-      { msg: "Premium activated successfully!", type: "success" },
-      { msg: "Payment succeeded! Updating subscription...", type: "success" },
-      { msg: "Waiting for payment confirmation...", type: "success" },
-      { msg: "Payment received! If features aren't unlocked, use Refresh in Settings.", type: "success" },
-      { msg: 'Note "Example" not found', type: "error" },
-      { msg: "Premium feature - subscribe to export notes", type: "error" },
-      { msg: "Premium feature - subscribe to import notes", type: "error" },
-      { msg: "Could not confirm payment. Please refresh in Settings.", type: "error" },
-      { msg: "Error refreshing subscription status.", type: "error" },
-      { msg: "Subscription process was canceled.", type: "error" },
-      { msg: "Error: Failed to save note", type: "error" },
-    ];
-
-    (window as any).__testToast = (filter?: "success" | "error" | "progress") => {
-      if (filter === "progress") {
-        // Test ProgressToast states
-        const steps: ProgressData[] = [
-          { status: "loading", message: "Exporting notes...", percent: 35 },
-          { status: "loading", message: "Importing notes...", percent: 70 },
-          { status: "success", message: "Export complete!", percent: 100 },
-          { status: "error", message: "Import failed", percent: 60 },
-        ];
-        let i = 0;
-        setProgressData(steps[0]);
-        const iv = setInterval(() => {
-          i++;
-          if (i >= steps.length) { clearInterval(iv); setTimeout(() => setProgressData(null), 2500); return; }
-          setProgressData(steps[i]);
-        }, 2500);
-        return;
-      }
-
-      const list = filter ? allToasts.filter(t => t.type === filter) : allToasts;
-      let i = 0;
-
-      const show = () => {
-        if (i >= list.length) { setToastMessage(null); return; }
-        setToastType(list[i].type);
-        setToastMessage(`[${i + 1}/${list.length}] ${list[i].msg}`);
-        i++;
-        setTimeout(show, 2500);
-      };
-      show();
-    };
-    return () => { delete (window as any).__testToast; };
-  }, []);
 
   const showErrorToast = useCallback((msg: string) => {
     setToastType("error");
@@ -152,7 +156,7 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
     [notes, currentId],
   );
 
-  const counts = useMemo<StatusCounts>(() => {
+  const computedCounts = useMemo<StatusCounts>(() => {
     const activeNotes = notes.filter((n) => !n.deleted);
     const c: StatusCounts = {
       active: 0,
@@ -166,12 +170,49 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
     return c;
   }, [notes]);
 
+  // Sidebar está memoizado: recibe escalares (y la hora redondeada al minuto)
+  // para que escribir una nota no lo vuelva a renderizar en cada guardado.
+  const sidebarStats = useMemo(() => {
+    let allNotes = 0;
+    let pinned = 0;
+    let trash = 0;
+    let lastSync = 0;
+    for (const n of notes) {
+      if (n.deleted) {
+        trash++;
+        continue;
+      }
+      allNotes++;
+      if (n.pinned) pinned++;
+      const t = n.updatedAt;
+      if (!t) continue;
+      const ms =
+        typeof t === "number" ? t : new Date(t as unknown as string).getTime();
+      if (Number.isFinite(ms) && ms > lastSync) lastSync = ms;
+    }
+    return {
+      allNotes,
+      pinned,
+      trash,
+      lastSync: Math.floor(lastSync / 60000) * 60000,
+    };
+  }, [notes]);
+
+  const counts = useStableValue(
+    computedCounts,
+    (a, b) =>
+      a.active === b.active &&
+      a.onhold === b.onhold &&
+      a.completed === b.completed &&
+      a.dropped === b.dropped,
+  );
+
   const linkedNote = useMemo<Note | null>(
     () => notes.find((n) => n.id === linkedNoteId) || null,
     [notes, linkedNoteId],
   );
 
-  const folderCounts = useMemo<FolderCounts>(() => {
+  const computedFolderCounts = useMemo<FolderCounts>(() => {
     // 1. Count direct notes per folder in a single pass over notes
     const directCounts: Record<number, number> = {};
     folders.forEach((f) => {
@@ -236,7 +277,13 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
     return counts;
   }, [notes, folders]);
 
-  const tags = useMemo<Tag[]>(() => {
+  const folderCounts = useStableValue(computedFolderCounts, (a, b) => {
+    const keys = Object.keys(a);
+    if (keys.length !== Object.keys(b).length) return false;
+    return keys.every((key) => a[Number(key)] === b[Number(key)]);
+  });
+
+  const computedTags = useMemo<Tag[]>(() => {
     const activeNotes = notes.filter((n) => !n.deleted);
     const m: Record<string, number> = {};
     activeNotes.forEach((n) =>
@@ -248,7 +295,16 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       .sort()
       .map((name) => ({ name, count: m[name] }));
   }, [notes]);
-  const debRef = useRef<number | undefined>(undefined);
+
+  const tags = useStableValue(
+    computedTags,
+    (a, b) => a.length === b.length && a.every((tag, i) => tag.name === b[i].name && tag.count === b[i].count),
+  );
+
+  // `tags.map(...)` crea un arreglo nuevo en cada render y rompía el memo de
+  // EditorPanel, que así se repintaba (con su TOC y su preview) en cada guardado.
+  const existingTagNames = useMemo(() => tags.map((t) => t.name), [tags]);
+  const saveTimersRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => {
     let mounted = true;
@@ -271,8 +327,14 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       .catch(() => {
         if (mounted) setIsLoading(false);
       });
+    const unsubscribeOfflineData = window.api.onOfflineDataChanged((data) => {
+      if (!mounted) return;
+      setNotes((prev) => reconcileById(prev, data.notes || []));
+      setFolders((prev) => reconcileById(prev, data.folders || []));
+    });
     return () => {
       mounted = false;
+      unsubscribeOfflineData();
     };
   }, []);
 
@@ -315,42 +377,44 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
           const val = drawingData || "";
           setCachedContent(currentId, val, "drawing");
           setNotes((prev) =>
-            prev.map((n) => (n.id === currentId ? { ...n, drawingData: val } : n))
+            prev.map((n) => (n.id === currentId && n.drawingData === undefined ? { ...n, drawingData: val } : n))
           );
-        });
+        }).catch(() => fetchedNotesRef.current.delete(currentId));
       } else {
         window.api.getNoteContent(currentId).then((content) => {
           const val = content || "";
           setCachedContent(currentId, val, "text");
           setNotes((prev) =>
-            prev.map((n) => (n.id === currentId ? { ...n, content: val } : n))
+            prev.map((n) => (n.id === currentId && n.content === undefined ? { ...n, content: val } : n))
           );
-        });
+        }).catch(() => fetchedNotesRef.current.delete(currentId));
       }
     }
 
-    // 3. Desalojar de memoria RAM el contenido de otras notas para optimizar consumo
-    const needsEviction = notes.some(
-      (n) =>
-        n.id !== currentId &&
-        n.id !== linkedNoteId &&
-        (n.content !== undefined || n.drawingData !== undefined)
-    );
-    if (needsEviction) {
-      setNotes((prev) =>
-        prev.map((n) => {
-          if (
-            n.id !== currentId &&
-            n.id !== linkedNoteId &&
-            (n.content !== undefined || n.drawingData !== undefined)
-          ) {
-            return { ...n, content: undefined, drawingData: undefined };
-          }
-          return n;
-        })
-      );
-    }
   }, [currentId, notes, linkedNoteId]);
+
+  // 3. Desalojar de memoria el contenido de las demás notas. Está separado del
+  // efecto anterior porque, al depender de `notes`, lanzaba un render extra en
+  // cada guardado; ahora solo reacciona al cambio de nota y devuelve el mismo
+  // estado cuando no hay nada que desalojar.
+  useEffect(() => {
+    if (!currentId) return;
+    setNotes((prev) => {
+      let changed = false;
+      const next = prev.map((n) => {
+        if (
+          n.id !== currentId &&
+          n.id !== linkedNoteId &&
+          (n.content !== undefined || n.drawingData !== undefined)
+        ) {
+          changed = true;
+          return { ...n, content: undefined, drawingData: undefined };
+        }
+        return n;
+      });
+      return changed ? next : prev;
+    });
+  }, [currentId, linkedNoteId]);
 
   useEffect(() => {
     if (!linkedNoteId) return;
@@ -373,9 +437,9 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
         const val = content || "";
         setCachedContent(linkedNoteId, val, "text");
         setNotes((prev) =>
-          prev.map((n) => (n.id === linkedNoteId ? { ...n, content: val } : n))
+          prev.map((n) => (n.id === linkedNoteId && n.content === undefined ? { ...n, content: val } : n))
         );
-      });
+      }).catch(() => fetchedNotesRef.current.delete(linkedNoteId));
     }
   }, [linkedNoteId, notes]);
 
@@ -464,33 +528,34 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       if (newNote) {
         newNote.noteType = noteType;
         fetchedNotesRef.current.add(newNote.id);
-        setNotes((prev) => [...prev, newNote]);
+        // createNote ya emite la nota desde el store local; insertarla solo si no existe
+        setNotes((prev) =>
+          prev.some((n) => n.id === newNote.id)
+            ? prev.map((n) => (n.id === newNote.id ? { ...n, ...newNote } : n))
+            : [...prev, newNote],
+        );
         setCurrentId(newNote.id);
       }
     },
     [selectedFolderId, safeUpdate],
   );
 
+  const handleAddTextNote = useCallback(() => onAddNote("text"), [onAddNote]);
+
   const saveNote = useCallback((note: Note) => {
-    // Guardar inmediatamente en caché local
-    if (note.noteType === "drawing") {
-      if (note.drawingData !== undefined) {
-        setCachedContent(note.id, note.drawingData, "drawing");
-      }
-    } else {
-      if (note.content !== undefined) {
-        setCachedContent(note.id, note.content, "text");
-      }
+    // La persistencia local se agenda más abajo, una sola vez por ráfaga de tecleo
+    const durableNote = {
+      ...note,
+      preview: (note.content || "").replace(/!\\[.*?\\]\\(.*?\\)/g, "").replace(/[#*_`~\\[\\]]/g, "").trim().substring(0, 150),
+      updatedAt: Date.now(),
+      ...(note.noteType === "drawing" && note.drawingData !== undefined ? { drawingData: note.drawingData } : {}),
+    };
+    if (note.noteType !== "drawing" && note.content !== undefined) {
+      setCachedContent(note.id, note.content, "text");
     }
 
     // Asegurar que no hagamos fetch en segundo plano de lo que acabamos de guardar
     fetchedNotesRef.current.add(note.id);
-
-    const preview = (note.content || "")
-      .replace(/!\[.*?\]\(.*?\)/g, "")
-      .replace(/[#*_`~\[\]]/g, "")
-      .trim()
-      .substring(0, 150);
 
     const hasDrawingData =
       note.noteType === "drawing" && note.drawingData
@@ -504,9 +569,7 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
         })()
         : note.hasDrawingData;
     const noteWithPreview = {
-      ...note,
-      preview,
-      updatedAt: Date.now(),
+      ...durableNote,
       hasDrawingData,
     };
 
@@ -514,29 +577,43 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       prev.map((n) => (n.id === note.id ? noteWithPreview : n)),
     );
 
-    if (debRef.current !== undefined) clearTimeout(debRef.current);
-    debRef.current = setTimeout(async () => {
-      const imageRegex = /!\[.*?\]\((assets\/.*?)\)/g;
-      const referencedImages: string[] = [];
-      let match;
-      while ((match = imageRegex.exec(note.content || "")) !== null) {
-        referencedImages.push(match[1]);
-      }
+    const pending = saveTimersRef.current;
+    const scheduled = pending.get(note.id);
+    if (scheduled !== undefined) clearTimeout(scheduled);
+    pending.set(
+      note.id,
+      window.setTimeout(async () => {
+        pending.delete(note.id);
 
-      if (note.images && note.images.length > 0) {
-        await window.api.cleanUnusedAssets({
-          noteId: note.id,
-          referencedImages,
-        });
-      }
+        const imageRegex = /!\[.*?\]\((assets\/.*?)\)/g;
+        const referencedImages: string[] = [];
+        let match;
+        while ((match = imageRegex.exec(note.content || "")) !== null) {
+          referencedImages.push(match[1]);
+        }
+        noteWithPreview.images = referencedImages;
 
-      noteWithPreview.images = referencedImages;
+        // `updateNote` ya persiste en el store local y encola la subida, así
+        // que se guarda una sola vez por ráfaga: cada escritura del store es un
+        // fsync síncrono sobre el hilo de la UI.
+        const saved = await safeUpdate(
+          () => window.api.updateNote(noteWithPreview),
+          "Could not save note locally. Changes may be lost if the app closes."
+        );
+        if (!saved) return;
 
-      await safeUpdate(
-        () => window.api.updateNote(noteWithPreview),
-        "Could not save note"
-      );
-    }, 200);
+        if (note.images && note.images.length > 0 && navigator.onLine) {
+          try {
+            await window.api.cleanUnusedAssets({
+              noteId: note.id,
+              referencedImages,
+            });
+          } catch {
+            // Limpiar assets no debe impedir que la nota quede guardada.
+          }
+        }
+      }, 250),
+    );
   }, [safeUpdate]);
 
   const onDelete = useCallback(async (note: Note) => {
@@ -829,7 +906,11 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       "Could not duplicate note"
     );
     if (result) {
-      setNotes((prev) => [...prev, duplicated]);
+      setNotes((prev) =>
+        prev.some((n) => n.id === duplicated.id)
+          ? prev.map((n) => (n.id === duplicated.id ? { ...n, ...duplicated } : n))
+          : [...prev, duplicated],
+      );
       setCurrentId(duplicated.id);
     }
   }, [safeUpdate]);
@@ -840,8 +921,10 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       setTimeout(() => setToastMessage(null), 3000);
       return;
     }
-    await window.api.exportNote(note.id, format);
-  }, [isPremium]);
+    const result = await window.api.exportNote(note.id, format);
+    const rejection = getPremiumRejectionMessage(result?.code, "export");
+    if (rejection) showErrorToast(rejection);
+  }, [isPremium, showErrorToast]);
 
   const onImport = useCallback(async () => {
     if (!isPremium) {
@@ -850,25 +933,28 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
       return;
     }
     const result = await window.api.importNote();
-    if (result?.success) {
-      const data = await window.api.getAllData();
-      setFolders(data.folders || []);
-      setNotes((prevNotes) => {
-        return (data.notes || []).map((n: Note) => {
-          const existing = prevNotes.find((p) => p.id === n.id);
-          if (existing && existing.content !== undefined) {
-            return { ...n, content: existing.content };
-          }
-          return n;
-        });
-      });
-      if (result.notes && result.notes.length > 0) {
-        setCurrentId(result.notes[0].id);
-      } else if (result.note) {
-        setCurrentId(result.note.id);
-      }
+    if (!result?.success) {
+      const rejection = getPremiumRejectionMessage(result?.code, "import");
+      if (rejection) showErrorToast(rejection);
+      return;
     }
-  }, [isPremium]);
+    const data = await window.api.getAllData();
+    setFolders(data.folders || []);
+    setNotes((prevNotes) => {
+      return (data.notes || []).map((n: Note) => {
+        const existing = prevNotes.find((p) => p.id === n.id);
+        if (existing && existing.content !== undefined) {
+          return { ...n, content: existing.content };
+        }
+        return n;
+      });
+    });
+    if (result.notes && result.notes.length > 0) {
+      setCurrentId(result.notes[0].id);
+    } else if (result.note) {
+      setCurrentId(result.note.id);
+    }
+  }, [isPremium, showErrorToast]);
 
   const onMoveToFolder = useCallback(
     async (noteId: number, folderId: number | null) => {
@@ -1025,11 +1111,11 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
                 setToastType("success");
                 setToastMessage("Waiting for payment confirmation...");
               } else if (attempt >= 15) {
+                // Sin confirmación del backend no se concede acceso.
                 clearInterval(interval);
                 setIsSubscriptionLoading(false);
-                onAccessChanged(true);
-                setToastType("success");
-                setToastMessage("Payment received! If features aren't unlocked, use Refresh in Settings.");
+                setToastType("error");
+                setToastMessage("We couldn't confirm the payment yet. Check your status in Settings.");
                 setTimeout(() => setToastMessage(null), 6000);
               }
             } catch {
@@ -1037,6 +1123,7 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
               if (attempt >= 15) {
                 clearInterval(interval);
                 setIsSubscriptionLoading(false);
+                setToastType("error");
                 setToastMessage("Could not confirm payment. Please refresh in Settings.");
                 setTimeout(() => setToastMessage(null), 5000);
               }
@@ -1062,8 +1149,9 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
 
     try {
       const status = subscriptionStatus ?? (await loadSubscriptionStatus());
+      const action = getSubscriptionAction(status.status);
       const { url } =
-        status.status === "active"
+        action.mode === "portal"
           ? await apiClient.createPortalSession()
           : await apiClient.createCheckoutSession();
       window.api.openExternal(url);
@@ -1111,6 +1199,12 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
   }, [loadSubscriptionStatus]);
 
   const onSelect = useCallback((n: Note) => setCurrentId(n.id), []);
+  const handleOpenBrainNote = useCallback((noteId: number) => {
+    setLinkedNoteId(null);
+    setSelectedFolderId(null);
+    setView("all-notes");
+    setCurrentId(noteId);
+  }, []);
   const onMinimize = useCallback(() => window.api.minimizeWindow(), []);
   const onClose = useCallback(() => window.api.closeWindow(), []);
 
@@ -1118,7 +1212,10 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
     <div className="dashboard-container">
       {!isFocusMode && (
         <Sidebar
-          notes={notes}
+          allNotesCount={sidebarStats.allNotes}
+          pinnedCount={sidebarStats.pinned}
+          trashCount={sidebarStats.trash}
+          lastSyncTime={sidebarStats.lastSync}
           folders={folders}
           view={view}
           selectedFolderId={selectedFolderId}
@@ -1131,6 +1228,8 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
           onFolderRename={onFolderRename}
           counts={counts}
           tags={tags}
+          activeTag={graphTag}
+          onBrainTagChange={setGraphTag}
           onNoteDrop={onNoteDrop}
           onFolderDrop={onFolderDrop}
           userName={userName}
@@ -1142,18 +1241,31 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
           onCloseSettings={handleCloseSettings}
           onSettingsSectionChange={handleSettingsSectionChange}
           isPremium={isPremium}
+          onErrorToast={showErrorToast}
         />
       )}
       <div className="main-content">
         <WindowBar onMinimize={onMinimize} onClose={onClose} />
         <div className="content-container">
           {!isSettingsView ? (
+            view === "brain" ? (
+              <React.Suspense fallback={null}>
+                <BrainGraph
+                  notes={notes}
+                  folders={folders}
+                  activeNoteId={currentId}
+                  onOpenNote={handleOpenBrainNote}
+                  activeTag={graphTag}
+                  onActiveTagChange={setGraphTag}
+                />
+              </React.Suspense>
+            ) : (
             <>
               {!isFocusMode && (
                 <NotesListPanel
                   notes={filteredNotes}
                   currentNoteId={currentId}
-                  onAddNote={() => onAddNote("text")}
+                  onAddNote={handleAddTextNote}
                   onSelect={onSelect}
                   isTrashView={view === "trash"}
                   title={panelTitle}
@@ -1184,7 +1296,7 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
                 onPin={onPin}
                 isTrashView={view === "trash"}
                 onNoteLinkClick={handleNoteLinkClick}
-                existingTags={tags.map((t) => t.name)}
+                existingTags={existingTagNames}
                 onNoteTypeChange={onNoteTypeChange}
               />
 
@@ -1203,6 +1315,7 @@ export default function Dashboard({ userName, userEmail, onLogout, isPremium, on
                 />
               )}
             </>
+            )
           ) : (
             <div className="settings-content">
               {settingsSection === "account" && (

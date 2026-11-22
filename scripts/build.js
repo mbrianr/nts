@@ -2,6 +2,17 @@ const esbuild = require("esbuild");
 const fs = require("fs");
 const path = require("path");
 
+// esbuild define `process.env.NODE_ENV` como "development" salvo que se
+// minifique, así que el bundle de release incluía React de desarrollo: cada
+// render se duplicaba por StrictMode y arrastraba comprobaciones y avisos que
+// no existen en producción. En release se compila en modo producción; con
+// `pnpm dev` (--watch) se mantiene desarrollo para conservar esos mensajes.
+const watchMode = process.argv.includes("--watch");
+const devBuild =
+  watchMode ||
+  process.argv.includes("--dev") ||
+  process.env.NODE_ENV === "development";
+
 async function buildAll(watch = false) {
   const entries = [
     { in: "src/renderer/index.tsx", out: "src/renderer/index.js" },
@@ -31,6 +42,19 @@ async function buildAll(watch = false) {
     }
   };
 
+  // Limpia bundles con hash de builds anteriores (ej. BrainGraph-*.js
+  // huérfanos): solo en build release, nunca en watch.
+  if (!watch) {
+    const distDir = path.join(__dirname, "../dist");
+    if (fs.existsSync(distDir)) {
+      for (const f of fs.readdirSync(distDir)) {
+        if (/\.(js|css|map)$/.test(f)) {
+          fs.rmSync(path.join(distDir, f), { force: true });
+        }
+      }
+    }
+  }
+
   for (const e of entries) {
     const buildOptions = {
       entryPoints: [e.in],
@@ -51,6 +75,12 @@ async function buildAll(watch = false) {
         ".gif": "file",
       },
       sourcemap: false,
+      // Release minificado (menor parse/heap); en dev/watch se mantiene legible y rápido.
+      minify: !devBuild,
+      define: {
+        "process.env.NODE_ENV": JSON.stringify(devBuild ? "development" : "production"),
+        "process.env.NTS_API_URL": JSON.stringify(process.env.NTS_API_URL || ""),
+      },
     };
 
     if (watch) {
@@ -68,7 +98,6 @@ async function buildAll(watch = false) {
   }
 }
 
-const watchMode = process.argv.includes("--watch");
 buildAll(watchMode).catch((err) => {
   console.error(err);
   process.exit(1);

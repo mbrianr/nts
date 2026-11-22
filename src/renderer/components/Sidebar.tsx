@@ -1,6 +1,6 @@
 import React, { useState, memo, useCallback, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import type { Note, Folder, StatusCounts, Tag } from "../types/models";
+import type { Folder, StatusCounts, Tag } from "../types/models";
 import "./Sidebar.css";
 import FolderTree from "./FolderTree";
 import InputModal from "./InputModal";
@@ -8,6 +8,28 @@ import buttonIcon from "../assets/icons/button.png";
 import pauseIcon from "../assets/icons/pause.png";
 import checkedIcon from "../assets/icons/checked.png";
 import removeIcon from "../assets/icons/remove.png";
+import { getPremiumRejectionMessage } from "../utils/subscription";
+
+// Formateadores creados una sola vez: `toLocale*` en cada render es caro.
+const syncTimeFormatter = new Intl.DateTimeFormat("en-US", {
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+});
+const syncDateFormatter = new Intl.DateTimeFormat("en-US", {
+  month: "short",
+  day: "numeric",
+});
+
+function formatSyncDate(timestamp: number): string {
+  if (!timestamp) return "";
+  const date = new Date(timestamp);
+  const timeStr = syncTimeFormatter.format(date);
+  if (date.toDateString() === new Date().toDateString()) {
+    return timeStr;
+  }
+  return `${syncDateFormatter.format(date)}, ${timeStr}`;
+}
 
 interface NavItemProps {
   itemView: string;
@@ -37,7 +59,12 @@ const NavItem = memo(function NavItem({
 });
 
 interface SidebarProps {
-  notes: Note[];
+  /** Conteos y hora de sincronización como escalares: si llegara el arreglo de
+   * notas, el memo del sidebar se rompería en cada guardado mientras se escribe. */
+  allNotesCount: number;
+  pinnedCount: number;
+  trashCount: number;
+  lastSyncTime: number;
   folders: Folder[];
   view: string;
   selectedFolderId: number | null;
@@ -51,6 +78,10 @@ interface SidebarProps {
   folderCounts: Record<number, number>;
   counts: StatusCounts;
   tags: Tag[];
+  /** Tag highlighted in the brain graph, if any. */
+  activeTag?: string | null;
+  /** In the brain view, a tag click filters the graph instead of changing the list view. */
+  onBrainTagChange?: (tag: string | null) => void;
   onNoteDrop?: (noteId: number, targetFolderId: number) => void;
   onFolderDrop?: (folderId: number, targetFolderId: number | null) => void;
   userName: string;
@@ -61,10 +92,14 @@ interface SidebarProps {
   onCloseSettings: () => void;
   onSettingsSectionChange: (section: "account") => void;
   isPremium: boolean;
+  onErrorToast?: (message: string) => void;
 }
 
 const Sidebar = memo(function Sidebar({
-  notes,
+  allNotesCount,
+  pinnedCount,
+  trashCount,
+  lastSyncTime,
   folders,
   view,
   selectedFolderId,
@@ -77,6 +112,8 @@ const Sidebar = memo(function Sidebar({
   onFolderRename,
   counts,
   tags,
+  activeTag,
+  onBrainTagChange,
   onNoteDrop,
   onFolderDrop,
   userName,
@@ -88,6 +125,7 @@ const Sidebar = memo(function Sidebar({
   onCloseSettings,
   onSettingsSectionChange,
   isPremium,
+  onErrorToast,
 }: SidebarProps) {
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<
@@ -95,38 +133,11 @@ const Sidebar = memo(function Sidebar({
   >({});
   const [sidebarWidth, setSidebarWidth] = useState(240);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const sidebarNavRef = useRef<HTMLElement>(null);
+  const foldersSectionRef = useRef<HTMLDivElement>(null);
+  const [hasMoreSidebarContent, setHasMoreSidebarContent] = useState(false);
   const isResizing = useRef(false);
   const [isExporting, setIsExporting] = useState(false);
-
-  const lastSyncTime = React.useMemo(() => {
-    const timestamps = notes
-      .filter((n) => !n.deleted && n.updatedAt)
-      .map((n) => {
-        const t = n.updatedAt;
-        return typeof t === "number"
-          ? t
-          : new Date(t as unknown as string).getTime();
-      });
-    return timestamps.length > 0 ? Math.max(...timestamps) : 0;
-  }, [notes]);
-  const formatSyncDate = (timestamp: number): string => {
-    if (!timestamp) return "";
-    const date = new Date(timestamp);
-    const now = new Date();
-    const timeStr = date.toLocaleTimeString("en-US", {
-      hour: "numeric",
-      minute: "2-digit",
-      hour12: true,
-    });
-    if (date.toDateString() === now.toDateString()) {
-      return timeStr;
-    }
-    const dateStr = date.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-    });
-    return `${dateStr}, ${timeStr}`;
-  };
 
   const handleExportAllNotes = async () => {
     if (!isPremium) return;
@@ -136,6 +147,9 @@ const Sidebar = memo(function Sidebar({
       const result = await window.api.exportAllNotes();
       if (result.success) {
         console.log("Exported all notes to:", result.path);
+      } else {
+        const rejection = getPremiumRejectionMessage(result.code, "export");
+        if (rejection) onErrorToast?.(rejection);
       }
     } catch (error) {
       console.error("Failed to export all notes:", error);
@@ -155,6 +169,44 @@ const Sidebar = memo(function Sidebar({
     isResizing.current = true;
     e.preventDefault();
   }, []);
+
+  useEffect(() => {
+    const nav = sidebarNavRef.current;
+    const foldersSection = foldersSectionRef.current;
+    if (!nav) return;
+
+    const updateScrollIndicator = () => {
+      if (!foldersSection || isSettingsView || collapsedSections["folders"]) {
+        setHasMoreSidebarContent(false);
+        return;
+      }
+
+      const navBounds = nav.getBoundingClientRect();
+      const foldersBounds = foldersSection.getBoundingClientRect();
+      setHasMoreSidebarContent(foldersBounds.bottom > navBounds.bottom + 1);
+    };
+
+    updateScrollIndicator();
+    nav.addEventListener("scroll", updateScrollIndicator, { passive: true });
+
+    const resizeObserver = new ResizeObserver(updateScrollIndicator);
+    resizeObserver.observe(nav);
+    if (foldersSection) resizeObserver.observe(foldersSection);
+
+    return () => {
+      nav.removeEventListener("scroll", updateScrollIndicator);
+      resizeObserver.disconnect();
+    };
+  }, [folders, tags, collapsedSections, isSettingsView]);
+
+  const showMoreSidebarContent = () => {
+    const nav = sidebarNavRef.current;
+    if (!nav) return;
+    nav.scrollBy({
+      top: Math.max(nav.clientHeight * 0.75, 80),
+      behavior: "smooth",
+    });
+  };
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -187,9 +239,11 @@ const Sidebar = memo(function Sidebar({
         <pre className="ascii-logo">{`█░░ ▄▀█ █ █▄░█
 █▄▄ █▀█ █ █░▀█`}</pre>
       </div>
-      <nav className="sidebar-nav">
-        {!isSettingsView ? (
-          <>
+      <div className="sidebar-scroll-container">
+        <nav className="sidebar-nav" ref={sidebarNavRef}>
+          <div className="sidebar-nav-content">
+            {!isSettingsView ? (
+              <>
             <div className="nav-section" id="mainLinksSection">
               <NavItem
                 itemView="all-notes"
@@ -209,8 +263,29 @@ const Sidebar = memo(function Sidebar({
                 </svg>
                 <span>All Notes</span>
                 <span className="nav-count" id="allNotesCount">
-                  {String(notes.filter((n) => !n.deleted).length)}
+                  {String(allNotesCount)}
                 </span>
+              </NavItem>
+
+              <NavItem
+                itemView="brain"
+                currentView={view}
+                onViewChange={onViewChange}
+              >
+                <svg
+                  width={16}
+                  height={16}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth={2}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 4.44-2.54Z" />
+                  <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-4.44-2.54Z" />
+                </svg>
+                <span>Brain Graph</span>
               </NavItem>
 
               <NavItem
@@ -231,7 +306,7 @@ const Sidebar = memo(function Sidebar({
                 </svg>
                 <span>Pinned Notes</span>
                 <span className="nav-count" id="pinnedCount">
-                  {String(notes.filter((n) => !n.deleted && n.pinned).length)}
+                  {String(pinnedCount)}
                 </span>
               </NavItem>
 
@@ -253,7 +328,7 @@ const Sidebar = memo(function Sidebar({
                 </svg>
                 <span>Trash</span>
                 <span className="nav-count" id="trashCount">
-                  {String(notes.filter((n) => n.deleted).length)}
+                  {String(trashCount)}
                 </span>
               </NavItem>
             </div>
@@ -314,6 +389,7 @@ const Sidebar = memo(function Sidebar({
                   <motion.div
                     className="nav-subsection"
                     id="foldersSection"
+                    ref={foldersSectionRef}
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: "auto" }}
                     exit={{ opacity: 0, height: 0 }}
@@ -467,21 +543,28 @@ const Sidebar = memo(function Sidebar({
                     transition={{ duration: 0.2, ease: "easeInOut" }}
                     style={{ overflow: "hidden" }}
                   >
-                    {tags.map((t) => (
-                      <a
-                        key={t.name}
-                        href="#"
-                        className={`nav-item nav-nested ${view === `tag-${t.name}` ? "active" : ""}`}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          onViewChange(`tag-${t.name}`);
-                        }}
-                      >
-                        <span className="tag-hash">#</span>
-                        <span>{t.name}</span>
-                        <span className="nav-count">{String(t.count)}</span>
-                      </a>
-                    ))}
+                    {tags.map((t) => {
+                      const isActive = view === `tag-${t.name}` || (view === "brain" && activeTag === t.name);
+                      return (
+                        <a
+                          key={t.name}
+                          href="#"
+                          className={`nav-item nav-nested ${isActive ? "active" : ""}`}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            if (view === "brain" && onBrainTagChange) {
+                              onBrainTagChange(activeTag === t.name ? null : t.name);
+                            } else {
+                              onViewChange(`tag-${t.name}`);
+                            }
+                          }}
+                        >
+                          <span className="tag-hash">#</span>
+                          <span>{t.name}</span>
+                          <span className="nav-count">{String(t.count)}</span>
+                        </a>
+                      );
+                    })}
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -529,10 +612,40 @@ const Sidebar = memo(function Sidebar({
               </svg>
               <span>Log out</span>
             </a>
-
           </div>
-        )}
-      </nav>
+            )}
+          </div>
+        </nav>
+        <AnimatePresence initial={false}>
+          {hasMoreSidebarContent && (
+            <motion.button
+              className="sidebar-scroll-more"
+              type="button"
+              aria-label="Desplazar para ver más contenido"
+              title="Ver más contenido"
+              onClick={showMoreSidebarContent}
+              initial={{ opacity: 0, y: 8, scale: 0.9 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.9 }}
+              transition={{ duration: 0.18, ease: "easeOut" }}
+            >
+              <svg
+                width={14}
+                height={14}
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={2.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </motion.button>
+          )}
+        </AnimatePresence>
+      </div>
       <div className="sidebar-footer">
         <div className="sidebar-user-info">
           {isSettingsView ? (

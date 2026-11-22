@@ -1,6 +1,5 @@
 const { getSecureToken, saveSecureToken } = require("./secureStorage.js");
-
-const API_URL = "https://nts-api-3e8i.onrender.com/api";
+const { API_URL } = require("../shared/apiConfig.js");
 
 function setToken(token) {
   saveSecureToken(token);
@@ -14,7 +13,11 @@ async function apiRequest(path, options = {}) {
     headers["Authorization"] = `Bearer ${authToken}`;
   }
   const res = await fetch(`${API_URL}${path}`, { headers, ...options });
-  if (!res.ok) throw new Error(`API error: ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(`API error: ${res.status}`);
+    error.status = res.status;
+    throw error;
+  }
   return res.json();
 }
 module.exports = { setToken, apiRequest };
