@@ -178,13 +178,27 @@ const NoteListItem = memo(function NoteListItem({
   );
 });
 
+const PAGE_SIZE = 100;
+
 const NotesListPanel = memo(function NotesListPanel({ notes, currentNoteId, onAddNote, onSelect, isTrashView, title,
   onNoteDrag, onPopOut, folders, onPin, onSetStatus, onMoveToFolder, onDuplicate, onDelete, onExport, onImport, isPremium }: NotesListPanelProps) {
   const [panelWidth, setPanelWidth] = useState(320);
   const panelRef = useRef<HTMLDivElement>(null);
   const isResizing = useRef(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [contextMenu, setContextMenu] = useState<{ note: Note; x: number; y: number } | null>(null);
+
+  // 3: debounce para no filtrar 5.800 notas en cada tecla.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(searchQuery), 180);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
+  // 1+2: paginar la lista (100 iniciales + infinite scroll) para no meter
+  // miles de tarjetas al DOM. Al paginar, formatDate/preview solo se
+  // calculan para lo visible (punto 2: antes se formateaban las ~5.800).
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
+  const listBodyRef = useRef<HTMLDivElement>(null);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     isResizing.current = true;
@@ -194,6 +208,58 @@ const NotesListPanel = memo(function NotesListPanel({ notes, currentNoteId, onAd
   const handleContextMenu = useCallback((note: Note, x: number, y: number) => {
     setContextMenu({ note, x, y });
   }, []);
+
+  // 3+4: índice de búsqueda y epoch precalculados una vez por cambio de
+  // notas (no por tecla ni por comparación del sort). Mismo resultado,
+  // sin cambios visuales.
+  const prepared = React.useMemo(() => (
+    notes.map((n) => ({
+      n,
+      hay: (n.name || '').toLowerCase(),
+      epoch: toEpoch(n.updatedAt),
+    }))
+  ), [notes]);
+
+  // Filtrado + orden memoizados: un solo sort por render de lista.
+  const lowerQuery = debouncedQuery.toLowerCase();
+  const sortedFiltered = React.useMemo(() => {
+    const filtered = lowerQuery
+      ? prepared.filter((p) => p.hay.includes(lowerQuery))
+      : prepared.slice();
+    filtered.sort((a, b) => {
+      if (a.n.pinned && !b.n.pinned) return -1;
+      if (!a.n.pinned && b.n.pinned) return 1;
+      return b.epoch - a.epoch;
+    });
+    return filtered.map((p) => p.n);
+  }, [prepared, lowerQuery]);
+
+  // Resetear la ventana al buscar; recortarla si la lista se achica.
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+    listBodyRef.current?.scrollTo({ top: 0 });
+  }, [lowerQuery]);
+  useEffect(() => {
+    setVisibleCount((c) => Math.min(Math.max(c, PAGE_SIZE), Math.max(sortedFiltered.length, PAGE_SIZE)));
+  }, [sortedFiltered.length]);
+
+  // Si la nota activa queda fuera de la ventana (p. ej. viene de Brain),
+  // ampliar hasta incluirla para no perder el resaltado.
+  useEffect(() => {
+    if (currentNoteId == null) return;
+    const idx = sortedFiltered.findIndex(n => n.id === currentNoteId);
+    if (idx >= 0) setVisibleCount((c) => Math.min(sortedFiltered.length, Math.max(c, idx + 1)));
+  }, [currentNoteId, sortedFiltered]);
+
+  const visibleNotes = sortedFiltered.slice(0, visibleCount);
+
+  const handleListScroll = useCallback(() => {
+    const el = listBodyRef.current;
+    if (!el) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 600) {
+      setVisibleCount((c) => c >= sortedFiltered.length ? c : Math.min(c + PAGE_SIZE, sortedFiltered.length));
+    }
+  }, [sortedFiltered.length]);
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
@@ -248,26 +314,14 @@ const NotesListPanel = memo(function NotesListPanel({ notes, currentNoteId, onAd
           )}
         </div>
       </div>
-      <div className="notes-list-body" id="notesListPanel">
-        {(() => {
-          const filtered = notes.filter(n => {
-            if (!searchQuery) return true;
-            return (n.name || '').toLowerCase().includes(searchQuery.toLowerCase());
-          });
-          if (filtered.length === 0) {
-            return (
-              <div className="no-items-message">
-                {searchQuery ? 'No notes found' : 'No notes'}
-              </div>
-            );
-          }
-          return filtered
-            .sort((a, b) => {
-              if (a.pinned && !b.pinned) return -1;
-              if (!a.pinned && b.pinned) return 1;
-              return toEpoch(b.updatedAt) - toEpoch(a.updatedAt);
-            })
-            .map(n => (
+      <div className="notes-list-body" id="notesListPanel" ref={listBodyRef} onScroll={handleListScroll}>
+        {sortedFiltered.length === 0 ? (
+          <div className="no-items-message">
+            {searchQuery ? 'No notes found' : 'No notes'}
+          </div>
+        ) : (
+          <>
+            {visibleNotes.map(n => (
               <NoteListItem
                 key={n.id}
                 note={n}
@@ -277,8 +331,23 @@ const NotesListPanel = memo(function NotesListPanel({ notes, currentNoteId, onAd
                 onContextMenu={handleContextMenu}
                 onPopOut={onPopOut}
               />
-            ));
-        })()}
+            ))}
+            {visibleCount < sortedFiltered.length && (
+              <div style={{ padding: '12px 20px', textAlign: 'center' }}>
+                <div style={{ color: '#666', fontSize: 12, marginBottom: 8 }}>
+                  Showing {visibleNotes.length} of {sortedFiltered.length}
+                </div>
+                <button
+                  className="action-btn"
+                  style={{ width: 'auto', padding: '6px 16px', fontSize: 12, margin: '0 auto' }}
+                  onClick={() => setVisibleCount((c) => Math.min(c + PAGE_SIZE, sortedFiltered.length))}
+                >
+                  Show more
+                </button>
+              </div>
+            )}
+          </>
+        )}
       </div>
       {contextMenu && (
         <NoteContextMenu
